@@ -1,0 +1,24 @@
+# @package _global_
+
+#### Model params #############################################################
+model:
+  name: attn_longterm
+  hparams:
+    hidden_dim: 128
+    patch_len: 12
+    max_patches: 28
+    long_layers: 4
+    long_heads: 4
+    long_ff_size: 256
+    staw_kernel_size: 3
+    staw_dilations: [1, 2, 4]
+    staw_attn_heads: 4
+    graph_knn: 8
+    graph_tau: 0.7
+    dropout: 0.2
+
+window: 168
+horizon: 24
+stride: 1
+#TODO: for some reason does not work with ens
+loss_fn: mae

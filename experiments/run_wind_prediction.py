@@ -37,6 +37,8 @@ def get_model_class(model_str):
         model = ICONDummyModel
     elif model_str == 'rnn':
         model = tsl_models.RNNModel
+    elif model_str == 'attn_longterm':
+        model = models.AttentionLongTermSTGNN
     else:
         raise NotImplementedError(f'Model "{model_str}" not available.')
     return model
@@ -297,7 +299,7 @@ def run(cfg: DictConfig):
             metrics=sample_metrics, 
             predictor=predictor, 
             batch_size=cfg.batch_size,
-            device='cuda' if torch.cuda.is_available() else 'cpu'
+            device = 'cuda' if torch.cuda.is_available() else 'mps' if torch.backends.mps.is_available() else 'cpu'
         )
         print("Model metrics on NWP test set:")
         for k, v in metrics.compute().items():
