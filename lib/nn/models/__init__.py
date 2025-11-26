@@ -1,10 +1,12 @@
 from .learnable_models import (
+    TCNModel,
+    RNNModel,
     STGNN,
-    TimeThenSpace,
-    TimeAndSpace,
-    TimeThenGraphIsoModel,
-    GlobalLocalRNNModel,
     AttentionLongTermSTGNN,
 )
-from .baselines.persistence import PersistenceModel
-from .baselines.icon import ICONData, ICONDummyModel
+from .baselines import (
+    ICONData,
+    ICONDummyModel,
+    NaiveModel,
+    MovingAverageModel,
+)

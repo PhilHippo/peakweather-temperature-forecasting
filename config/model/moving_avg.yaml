@@ -1,0 +1,9 @@
+# @package _global_
+
+#### Model params #############################################################
+# Moving average: predicts the average of the last n observations
+model:
+  name: moving_avg
+  hparams:
+    window_size: 24  # Average of last 24 hours
+

@@ -1,8 +1,13 @@
 # @package _global_
 
 #### Model params #############################################################
+# ICON NWP baseline - uses ICON-CH1-EPS ensemble forecasts
 model:
   name: icon
   hparams: {} 
 
-nwp_test_set: True
+# Force probabilistic evaluation for ICON (Energy Score requires samples)
+loss_fn: ens
+
+# ICON provides its own test set evaluation
+nwp_test_set: true

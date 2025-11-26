@@ -1,7 +1,7 @@
 defaults:
   - _self_
-  - dataset: wind
-  - model: tts_imp
+  - dataset: temperature
+  - model: tcn
   - lr_scheduler: multistep
 
 #### Experiment params ########################################################
@@ -9,7 +9,7 @@ hydra:
   run:
     dir: logs/${dataset.name}/${model.name}/${now:%Y-%m-%d}/${now:%H-%M-%S}
 
-experiment_name: peakweather_wind
+experiment_name: peakweather_temperature
 mlflow_tracking_uri: null
 
 workers: 0
@@ -17,22 +17,25 @@ num_threads: 1
 
 #### Training params ##########################################################
 epochs: 200
-patience: 40
+patience: 20
 batch_size: 32
-train_batches: 300  # 1.0
 grad_clip_val: 5
 
-loss_fn: ens
+loss_fn: mae
 
 sampling:
   mc_samples_train: 16
   mc_samples_eval: 11
   mc_samples_test: 100
 
+scaler:
+  method: Standard
+  axis: global
+  scale_target: true
+
 optimizer:
   name: Adam
   hparams:
     lr: 0.001
 
-nwp_test_set: False
 load_model_path: null

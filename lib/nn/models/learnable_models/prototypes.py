@@ -12,7 +12,8 @@ from lib.nn.layers.sampling_readout import SamplingReadoutLayer
 from lib.nn.utils import maybe_cat_emb, maybe_cat_v
 
 
-class STGNN(BaseModel):
+class STGNNBase(BaseModel):
+    """Abstract base class for Spatiotemporal Graph Neural Networks."""
     available_embedding_pos = {'encoding', 'decoding'}
 
     def __init__(self, input_size: int, horizon: int,
@@ -26,7 +27,7 @@ class STGNN(BaseModel):
                  use_local_weights: Union[str, List[str]] = None,
                  activation: str = 'elu',
                  noise_mode: Literal["lin", "multi", "add", "none"] = "lin"):
-        super(STGNN, self).__init__()
+        super(STGNNBase, self).__init__()
 
         self.input_size = input_size
         self.horizon = horizon
@@ -143,7 +144,7 @@ class STGNN(BaseModel):
         return self.sample_decoder(out, mc_samples=mc_samples)
 
 
-class TimeThenSpace(STGNN):
+class TimeThenSpace(STGNNBase):
     available_embedding_pos = {'encoding', 'message_passing', 'decoding'}
 
     def __init__(self, input_size: int, horizon: int,
@@ -199,7 +200,7 @@ class TimeThenSpace(STGNN):
         return out
 
 
-class TimeAndSpace(STGNN):
+class TimeAndSpace(STGNNBase):
 
     def __init__(self, input_size: int, horizon: int, stmp_conv: nn.Module,
                  n_nodes: int = None,

@@ -11,35 +11,65 @@ from tsl.data import SpatioTemporalDataset, SpatioTemporalDataModule
 from tsl.data.preprocessing import scalers
 from tsl.experiment import Experiment
 from tsl.metrics import torch_metrics
-from tsl.nn import models as tsl_models
 
 import lib
 from lib.datasets import PeakWeather
 from lib.nn import models
 import lib.metrics
-from lib.nn.models import temperature_models
 from lib.nn.predictors import Predictor, SamplingPredictor
 
-def get_model_class(model_str):
-    # Forecasting models  ###############################################
-    if model_str == 'tcn':
-        model = temperature_models.TCNModel
-    elif model_str == 'enhanced_rnn':
-        model = temperature_models.EnhancedRNNModel
-    elif model_str == 'improved_stgnn':
-        model = temperature_models.ImprovedSTGNN
-    elif model_str == 'attn_longterm':
-        model = models.AttentionLongTermSTGNN
-    else:
-        raise NotImplementedError(f'Model "{model_str}" not available.')
-    return model
+# Learnable models (require training)
+LEARNABLE_MODELS = {
+    'tcn': models.TCNModel,
+    'rnn': models.RNNModel,
+    'stgnn': models.STGNN,
+    'attn_longterm': models.AttentionLongTermSTGNN,
+}
+
+# Baseline models (no training required)
+BASELINE_MODELS = {
+    'naive': models.NaiveModel,
+    'moving_avg': models.MovingAverageModel,
+    'icon': models.ICONDummyModel,
+}
+
+MODEL_REGISTRY = {**LEARNABLE_MODELS, **BASELINE_MODELS}
+
+
+def get_model_class(model_str: str):
+    """Get model class from string identifier."""
+    if model_str not in MODEL_REGISTRY:
+        available = ', '.join(MODEL_REGISTRY.keys())
+        raise ValueError(f'Model "{model_str}" not available. Choose from: {available}')
+    return MODEL_REGISTRY[model_str]
+
+
+def is_baseline_model(model_str: str) -> bool:
+    """Check if model is a non-trainable baseline."""
+    return model_str in BASELINE_MODELS
+
+
+def is_icon_model(model_str: str) -> bool:
+    """Check if model is the ICON NWP baseline."""
+    return model_str == 'icon'
+
 
 def run(cfg: DictConfig):
     ########################################
     # Get Dataset                          #
     ########################################
+    
+    # Check if we need ICON data
+    use_icon = is_icon_model(cfg.model.name) or cfg.get('nwp_test_set', False)
+    
+    # Prepare dataset params, adding ICON if needed
+    dataset_params = dict(cfg.dataset.hparams)
+    if use_icon:
+        # Ensure temperature ICON data is loaded
+        dataset_params['extended_nwp_vars'] = ['temperature']
+    
     # Load dataset with explicit target and covariate separation
-    dataset = PeakWeather(**cfg.dataset.hparams)
+    dataset = PeakWeather(**dataset_params)
     
     # Get connectivity
     adj = dataset.get_connectivity(**cfg.dataset.connectivity)
@@ -231,7 +261,6 @@ def run(cfg: DictConfig):
     # Print MLflow tracking URL (it's possible to use a remote or custom MLflow server)
     if mlflow_tracking_uri is None or mlflow_tracking_uri == './mlruns' or mlflow_tracking_uri.startswith('file://'):
         # Local file-based tracking
-        import os
         abs_mlruns_path = os.path.abspath('./mlruns')
         mlflow_url = f"file://{abs_mlruns_path}"
         print(f"\n{'='*80}")
@@ -259,10 +288,20 @@ def run(cfg: DictConfig):
                       )
 
     load_model_path = cfg.get('load_model_path')
+    is_baseline = is_baseline_model(cfg.model.name)
+    is_icon = is_icon_model(cfg.model.name)
     
-    if load_model_path is not None:
+    if is_baseline:
+        # Baseline models don't require training
+        print(f"\n{'='*80}")
+        print(f"Baseline Model: {cfg.model.name}")
+        print(f"  No training required - proceeding directly to evaluation")
+        print(f"{'='*80}\n")
+        result = dict()
+    elif load_model_path is not None:
         print(f"Loading model from checkpoint: {load_model_path}")
         predictor.load_model(load_model_path)
+        result = dict()
     else:
         trainer.fit(predictor,
                     train_dataloaders=dm.train_dataloader(),
@@ -279,7 +318,6 @@ def run(cfg: DictConfig):
         # Print MLflow run URL after training
         if hasattr(exp_logger, 'run_id') and exp_logger.run_id:
             if mlflow_tracking_uri is None or mlflow_tracking_uri == './mlruns' or mlflow_tracking_uri.startswith('file://'):
-                import os
                 abs_mlruns_path = os.path.abspath('./mlruns')
                 print(f"\n  MLflow Run Details:")
                 print(f"    Run ID: {exp_logger.run_id}")
@@ -292,19 +330,45 @@ def run(cfg: DictConfig):
                 print(f"    Experiment: {cfg.experiment_name}")
                 print(f"    View run at: {mlflow_tracking_uri}")
         print(f"{'='*80}\n")
+        result = checkpoint_callback.best_model_score.item()
 
     predictor.freeze()
-    
-    if load_model_path is None:
-        result = checkpoint_callback.best_model_score.item()
-    else:
-        result = dict()
 
     ########################################
     # testing                              #
     ########################################
     
-    trainer.test(predictor, dataloaders=dm.test_dataloader())
+    # ICON NWP evaluation (for ICON model or when nwp_test_set is True)
+    if use_icon and isinstance(predictor, SamplingPredictor):
+        print(f"\n{'='*80}")
+        print(f"ICON NWP Baseline Evaluation")
+        print(f"{'='*80}\n")
+        
+        icon_data = models.ICONData(pw_dataset=dataset)
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        
+        icon_metrics = icon_data.test_set_eval(
+            torch_dataset=torch_dataset,  # Use full dataset, not dm.testset
+            metrics=sample_metrics,
+            predictor=predictor,
+            batch_size=cfg.batch_size,
+            device=device
+        )
+        
+        # Print ICON results
+        print(f"\n{'='*80}")
+        print(f"ICON NWP Test Results:")
+        print(f"{'='*80}")
+        for name, value in icon_metrics.compute().items():
+            if isinstance(value, torch.Tensor):
+                value = value.item()
+            print(f"  {name}: {value:.4f}")
+            logger.info(f" - {name}: {value:.5f}")
+        print(f"{'='*80}\n")
+    
+    # Standard test evaluation (skip for ICON model since it uses custom evaluation)
+    if not is_icon:
+        trainer.test(predictor, dataloaders=dm.test_dataloader())
 
     return result
 
@@ -314,4 +378,3 @@ if __name__ == '__main__':
                      config_name='default')
     res = exp.run()
     logger.info(res)
-

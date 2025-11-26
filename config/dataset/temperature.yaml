@@ -6,21 +6,53 @@ defaults:
 dataset:
   name: Temperature
   hparams:
-    target_channels: 
+    root: ./PeakWeatherDataset
+    target_channels:
       - temperature
     covariate_channels: other
     freq: h
-    extended_topo_vars:
-      - DEM
-      - SLOPE_2000M_SIGRATIO1
+    station_type: meteo_station
+
+  splitting:
+    first_val_ts: [2024, 1, 1]
+    first_test_ts: [2024, 4, 1]
+
   connectivity:
+    threshold: 0.8
+    theta: null
+    include_self: false
+    knn: 8
     layout: edge_index
-    include_self: False
-    theta: 50
-    threshold: 0.9
+
+  # Temporal encodings - important for temperature seasonality
+  covariates:
+    year: true   # Annual cycle (critical for temperature)
+    day: true    # Daily cycle (diurnal variation)
+    weekday: false
+    mask: true
+    u_mask: true
+    v: true      # Include static node features
+
+  # Topographic features that affect temperature
+  static_attributes:
+    - latitude
+    - longitude
+    - station_height     # Altitude is crucial for temperature
+    - dem
+    - ASPECT_2000M_SIGRATIO1      # Sun exposure
+    - ASPECT_10000M_SIGRATIO1
+    - SLOPE_2000M_SIGRATIO1
+    - SLOPE_10000M_SIGRATIO1
+    - TPI_2000M                   # Topographic Position Index (valley vs ridge)
+    - TPI_10000M
 
 #### Windowing params #########################################################
-window: 168
-horizon: 24
+window: 72     # 3 days of hourly data
+horizon: 24    # 24-hour forecast
 stride: 1
 
+#### Scaling ##################################################################
+scaler:
+  method: Standard
+  axis: node      # Scale per-node (each station has different baseline temperature)
+  scale_target: true

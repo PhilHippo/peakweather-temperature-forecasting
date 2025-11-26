@@ -336,3 +336,4 @@ class AttentionLongTermSTGNN(BaseModel):
         out = out.view(b, n, self.horizon, self.output_size)
         out = out.permute(0, 2, 1, 3)
         return out
+

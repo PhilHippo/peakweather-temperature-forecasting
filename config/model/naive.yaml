@@ -1,7 +1,8 @@
 # @package _global_
 
 #### Model params #############################################################
+# Naive forecast: repeats the last observed value for all horizon steps
 model:
-  name: pers_st
-  hparams: 
-    lag: 1  # keep the last observation
+  name: naive
+  hparams: {}
+

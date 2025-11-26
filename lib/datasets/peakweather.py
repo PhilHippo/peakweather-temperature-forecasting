@@ -147,13 +147,13 @@ class PeakWeather(DatetimeDataset):
             return gaussian_kernel(distances, theta=theta)
 
 
-if __name__ == "__main__":
-    dataset = PeakWeather(root="data/v1",
-                         target_channels=["wind_direction", "wind_speed", "wind_gust"],
-                         covariate_channels="other",
-                         freq="h")
-    graph = dataset.get_connectivity(layout="dense",
-                                     include_self=False,
-                                     theta=50,
-                                     threshold=0.1)
-    print(dataset)
+# if __name__ == "__main__":
+#     dataset = PeakWeather(root="data/v1",
+#                          target_channels=["wind_direction", "wind_speed", "wind_gust"],
+#                          covariate_channels="other",
+#                          freq="h")
+#     graph = dataset.get_connectivity(layout="dense",
+#                                      include_self=False,
+#                                      theta=50,
+#                                      threshold=0.1)
+#     print(dataset)
