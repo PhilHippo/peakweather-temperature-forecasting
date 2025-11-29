@@ -5,9 +5,10 @@ import omegaconf
 import torch
 from omegaconf import DictConfig
 from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor, Callback
 from pytorch_lightning.loggers import MLFlowLogger
 import pytorch_lightning as pl
+import mlflow
 from tsl import logger
 from tsl.data import SpatioTemporalDataset, SpatioTemporalDataModule
 from tsl.data.preprocessing import scalers
@@ -36,6 +37,44 @@ BASELINE_MODELS = {
 }
 
 MODEL_REGISTRY = {**LEARNABLE_MODELS, **BASELINE_MODELS}
+
+
+class MLflowFlushCallback(Callback):
+    """Callback to flush MLflow metrics in real-time after each epoch."""
+    
+    def _flush_mlflow(self, logger):
+        """Flush MLflow run to ensure metrics are written immediately."""
+        if isinstance(logger, MLFlowLogger):
+            try:
+                # Get the MLflow run ID
+                run_id = logger.run_id
+                if run_id:
+                    # Set tracking URI if needed
+                    tracking_uri = logger.tracking_uri or './mlruns'
+                    mlflow.set_tracking_uri(tracking_uri)
+                    
+                    # Get the active run and ensure it's synced
+                    # Accessing the run forces a sync with the backend
+                    client = mlflow.tracking.MlflowClient(tracking_uri=tracking_uri)
+                    run = client.get_run(run_id)
+                    
+                    # Force file system sync by accessing run data
+                    # This ensures the file backend writes are flushed and visible in real-time
+                    _ = run.info
+                    _ = run.data
+            except Exception:
+                # Silently fail if flush doesn't work
+                pass
+    
+    def on_train_epoch_end(self, trainer, pl_module):
+        """Flush MLflow after each training epoch."""
+        for logger in trainer.loggers:
+            self._flush_mlflow(logger)
+    
+    def on_validation_epoch_end(self, trainer, pl_module):
+        """Flush MLflow after each validation epoch."""
+        for logger in trainer.loggers:
+            self._flush_mlflow(logger)
 
 
 def get_model_class(model_str: str):
@@ -316,6 +355,9 @@ def run(cfg: DictConfig):
     # Will place the logs in ./mlruns
     mlflow_tracking_uri = cfg.get('mlflow_tracking_uri', './mlruns')
     exp_logger = MLFlowLogger(experiment_name=cfg.experiment_name, tracking_uri=mlflow_tracking_uri)
+    
+    # Create callback to flush MLflow in real-time
+    mlflow_flush_callback = MLflowFlushCallback()
 
     # Print MLflow tracking URL (it's possible to use a remote or custom MLflow server)
     if mlflow_tracking_uri is None or mlflow_tracking_uri == './mlruns' or mlflow_tracking_uri.startswith('file://'):
@@ -344,7 +386,7 @@ def run(cfg: DictConfig):
                       accelerator='gpu' if torch.cuda.is_available() else 'cpu',
                       gradient_clip_val=cfg.grad_clip_val,
                       accumulate_grad_batches=cfg.get('accumulate_grad_batches', 1),
-                      callbacks=[early_stop_callback, checkpoint_callback, lr_monitor],
+                      callbacks=[early_stop_callback, checkpoint_callback, lr_monitor, mlflow_flush_callback],
                       enable_progress_bar=False,  # Disable tqdm to keep logs concise
                       log_every_n_steps=50  # Log every 50 steps to see progress
                       )

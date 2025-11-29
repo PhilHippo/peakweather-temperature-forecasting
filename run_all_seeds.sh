@@ -3,7 +3,8 @@
 # Run train_all_models.sh for multiple seeds
 # Usage: bash run_all_seeds.sh
 
-set -e  # Exit on error
+# Note: We don't use 'set -e' here because we want to continue
+# processing other seeds even if one fails
 
 # ============================================================================
 # Configuration
@@ -171,3 +172,9 @@ echo -e "${BLUE}View master summary: cat ${MASTER_LOG}${NC}"
 echo -e "${BLUE}View MLflow results: mlflow ui --backend-store-uri ./mlruns${NC}"
 echo ""
 
+# Exit with non-zero code if any seed failed
+if [ ${FAILED_SEEDS} -gt 0 ]; then
+    exit 1
+else
+    exit 0
+fi
