@@ -5,14 +5,22 @@
 # Based on: "Attention-Based Spatial-Temporal Graph Neural Network With Long-Term
 # Dependencies for Traffic Speed Prediction" (IEEE T-ITS, 2025)
 #
-# Key features:
-# - Gumbel-Sigmoid graph structure learning with KNN regularization
-# - STAWnet backbone (Gated TCN + Dynamic Attention Network)
+# Architecture (Traffic Speed Prediction Stage - Figure 4):
+# 1. Input Embedding + Feature Projection
+# 2. Transformer Encoder with RMSNorm + Learnable Positional Encoding
+# 3. Graph Structure Learning with Gumbel-Sigmoid
+# 4. STAWnet backbone (Gated TCN + Dynamic Attention Network)
 model:
   name: model3
   hparams:
     # Core dimensions
     hidden_dim: 128
+
+    # Transformer Encoder settings (paper: 1 layer in prediction stage)
+    encoder_layers: 4
+    encoder_heads: 4
+    encoder_ff_dim: 256
+    max_seq_len: 168
 
     # STAWnet settings
     staw_kernel_size: 3
@@ -20,11 +28,11 @@ model:
     staw_attn_heads: 4
 
     # Graph structure learning (KNN with k=10 as per paper)
-    graph_knn: 10
-    graph_tau: 1.0
+    graph_knn: 8
+    graph_tau: 0.7
 
     # Regularization
-    dropout: 0.1
+    dropout: 0.2
 
 # Windowing parameters
 window: 72

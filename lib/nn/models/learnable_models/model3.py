@@ -5,6 +5,7 @@ Implementation based on the Traffic Speed Prediction Stage from the paper:
 for Traffic Speed Prediction" (IEEE T-ITS, 2025)
 
 Key components:
+- RMSNorm Transformer Encoder for temporal feature extraction
 - Graph Structure Learning with Gumbel-Sigmoid for differentiable binary edges
 - STAWnet backbone (Gated TCN + Dynamic Attention Network)
 """
@@ -20,6 +21,150 @@ from torch.nn import functional as F
 
 from tsl.nn.models import BaseModel
 from lib.nn.layers.sampling_readout import SamplingReadoutLayer
+
+
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization.
+
+    Simplified normalization that preserves re-scaling invariance while
+    discarding re-centering invariance. Reduces computational overhead
+    compared to LayerNorm.
+    """
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.scale = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x: Tensor) -> Tensor:
+        # Replace NaN values with 0 to prevent propagation
+        x = torch.where(torch.isnan(x), torch.zeros_like(x), x)
+        # Cast to float32 for numerical stability during norm computation
+        dtype = x.dtype
+        x_fp32 = x.float()
+        norm = torch.mean(x_fp32.pow(2), dim=-1, keepdim=True)
+        # Use larger eps and clamp norm to prevent numerical issues
+        norm = torch.clamp(norm, min=self.eps)
+        result = x_fp32 * torch.rsqrt(norm)
+        return self.scale * result.to(dtype)
+
+
+class RMSNormTransformerLayer(nn.Module):
+    """Transformer encoder block with RMSNorm instead of LayerNorm.
+
+    Pre-norm architecture: RMSNorm -> Attention -> Residual -> RMSNorm -> FFN -> Residual
+    """
+
+    def __init__(self, dim: int, num_heads: int, ff_dim: int, dropout: float):
+        super().__init__()
+        self.norm1 = RMSNorm(dim)
+        self.norm2 = RMSNorm(dim)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.ff = nn.Sequential(
+            nn.Linear(dim, ff_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ff_dim, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        # Pre-norm attention
+        normed = self.norm1(x)
+        attn_out, _ = self.attn(normed, normed, normed, need_weights=False)
+        x = x + self.dropout(attn_out)
+        # Pre-norm FFN
+        x = x + self.ff(self.norm2(x))
+        return x
+
+
+class TemporalTransformerEncoder(nn.Module):
+    """Transformer encoder for temporal feature extraction.
+
+    Processes input sequences through transformer blocks with learnable
+    positional embeddings to capture temporal dependencies.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        max_seq_len: int,
+        num_layers: int,
+        num_heads: int,
+        ff_dim: int,
+        dropout: float,
+    ):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.max_seq_len = max_seq_len
+
+        # Input embedding (already projected to hidden_dim before this)
+        self.input_embed = nn.Linear(hidden_dim, hidden_dim)
+
+        # Learnable positional embeddings
+        self.positional = nn.Parameter(
+            torch.randn(1, max_seq_len, hidden_dim) * (1.0 / math.sqrt(hidden_dim))
+        )
+        self.dropout = nn.Dropout(dropout)
+
+        # Transformer layers
+        self.layers = nn.ModuleList([
+            RMSNormTransformerLayer(hidden_dim, num_heads, ff_dim, dropout)
+            for _ in range(num_layers)
+        ])
+
+        self.output_norm = RMSNorm(hidden_dim)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Args:
+            x: Input tensor [batch, time, nodes, hidden_dim]
+
+        Returns:
+            Encoded features [batch, nodes, hidden_dim] (last time step)
+        """
+        b, t, n, d = x.shape
+
+        # Reshape to process each node's time series: [batch * nodes, time, hidden]
+        x = x.permute(0, 2, 1, 3).contiguous()  # [batch, nodes, time, hidden]
+        x = x.view(b * n, t, d)
+
+        # Input embedding
+        x = self.input_embed(x)
+
+        # Add positional embeddings (handle sequences longer than max_seq_len)
+        if t <= self.max_seq_len:
+            x = x + self.positional[:, :t, :]
+        else:
+            # For longer sequences, use the last max_seq_len positions
+            pos = self.positional.expand(b * n, -1, -1)
+            # Interpolate positional embeddings if needed
+            pos_interp = F.interpolate(
+                pos.transpose(1, 2), size=t, mode='linear', align_corners=False
+            ).transpose(1, 2)
+            x = x + pos_interp
+
+        x = self.dropout(x)
+
+        # Apply transformer layers
+        for layer in self.layers:
+            x = layer(x)
+
+        x = self.output_norm(x)
+
+        # Take the last time step as the encoded representation
+        x = x[:, -1, :]  # [batch * nodes, hidden]
+
+        # Reshape back: [batch, nodes, hidden]
+        x = x.view(b, n, d)
+
+        return x
 
 
 class _CausalConv1d(nn.Module):
@@ -351,13 +496,14 @@ class Model3(BaseModel):
     Dependencies for Traffic Speed Prediction" (IEEE T-ITS, 2025)
 
     Architecture:
-        - Graph Structure Learning with Gumbel-Sigmoid for differentiable binary edges
-        - STAWnet backbone (Gated TCN + Dynamic Attention Network)
-        - Probabilistic output via Gaussian sampling layer
+        1. Input Embedding + Feature Projection
+        2. Transformer Encoder with RMSNorm and Learnable Positional Encoding
+        3. Graph Structure Learning with Gumbel-Sigmoid
+        4. STAWnet backbone (Gated TCN + Dynamic Attention Network)
+        5. Probabilistic output via Gaussian sampling layer
 
-    The model learns spatial dependencies dynamically through attention-based
-    graph structure learning, while temporal dependencies are captured through
-    gated temporal convolutions with multiple dilation rates.
+    The Transformer encoder captures temporal patterns, graph structure learning
+    infers spatial dependencies, and STAWnet combines both for prediction.
     """
 
     def __init__(
@@ -368,9 +514,16 @@ class Model3(BaseModel):
         output_size: Optional[int] = None,
         exog_size: int = 0,
         hidden_dim: int = 128,
+        # Encoder settings
+        encoder_layers: int = 4,
+        encoder_heads: int = 4,
+        encoder_ff_dim: int = 256,
+        max_seq_len: int = 168,
+        # STAWnet settings
         staw_kernel_size: int = 3,
         staw_dilations: Sequence[int] = (1, 2, 4),
         staw_attn_heads: int = 4,
+        # Graph learning settings
         graph_knn: int = 10,
         graph_tau: float = 1.0,
         dropout: float = 0.1,
@@ -383,11 +536,21 @@ class Model3(BaseModel):
         self.exog_size = exog_size
         self.hidden_dim = hidden_dim
 
-        # Feature projection
+        # Feature projection (Input Embedding in the paper)
         total_input = input_size + exog_size
         self.feature_proj = nn.Sequential(
             nn.Linear(total_input, hidden_dim),
             nn.GELU(),
+        )
+
+        # Transformer Encoder (from Figure 4 in the paper)
+        self.encoder = TemporalTransformerEncoder(
+            hidden_dim=hidden_dim,
+            max_seq_len=max_seq_len,
+            num_layers=encoder_layers,
+            num_heads=encoder_heads,
+            ff_dim=encoder_ff_dim,
+            dropout=dropout,
         )
 
         # Graph Structure Learning
@@ -411,7 +574,7 @@ class Model3(BaseModel):
             dropout=dropout,
         )
 
-        # Readout
+        # Readout MLP
         readout_hidden = (hidden_dim + self.output_size) // 2
 
         self.readout = nn.Sequential(
@@ -492,12 +655,13 @@ class Model3(BaseModel):
         x = self.feature_proj(x)
         b, _, n, _ = x.shape
 
-        # Graph Structure Learning
-        # Use mean-pooled temporal features for graph learning
-        node_repr = x.mean(dim=1)  # [batch, nodes, hidden]
+        # Encoder: Extract temporal features via Transformer
+        # Output: node representations H_i [batch, nodes, hidden]
+        encoded = self.encoder(x)
 
+        # Graph Structure Learning using encoded node representations
         if self.graph_learner is not None:
-            adjacency, knn_adj = self.graph_learner(node_repr)
+            adjacency, knn_adj = self.graph_learner(encoded)
             # Store regularization loss for training
             if self.training:
                 self.graph_reg_loss = self.compute_graph_reg_loss(adjacency, knn_adj)
