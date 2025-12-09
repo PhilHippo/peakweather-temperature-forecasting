@@ -1,0 +1,36 @@
+# @package _global_
+
+#### Model params #############################################################
+# Model3: Attention-based STGNN for Traffic Speed Prediction
+# Based on: "Attention-Based Spatial-Temporal Graph Neural Network With Long-Term
+# Dependencies for Traffic Speed Prediction" (IEEE T-ITS, 2025)
+#
+# Key features:
+# - Gumbel-Sigmoid graph structure learning with KNN regularization
+# - STAWnet backbone (Gated TCN + Dynamic Attention Network)
+model:
+  name: model3_old
+  hparams:
+    # Core dimensions
+    hidden_dim: 128
+
+    # STAWnet settings
+    staw_kernel_size: 3
+    staw_dilations: [1, 2, 4]
+    staw_attn_heads: 4
+
+    # Graph structure learning (KNN with k=10 as per paper)
+    graph_knn: 10
+    graph_tau: 1.0
+
+    # Regularization
+    dropout: 0.1
+
+# Windowing parameters
+window: 72
+horizon: 24
+stride: 1
+
+# Training settings
+loss_fn: ens
+patience: 40

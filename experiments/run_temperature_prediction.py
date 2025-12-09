@@ -27,6 +27,8 @@ LEARNABLE_MODELS = {
     'rnn': models.RNNModel,
     'stgnn': models.STGNN,
     'attn_longterm': models.AttentionLongTermSTGNN,
+    'model3': models.Model3,
+    'model3_old': models.Model3Old,
 }
 
 # Baseline models (no training required)
@@ -387,7 +389,7 @@ def run(cfg: DictConfig):
                       gradient_clip_val=cfg.grad_clip_val,
                       accumulate_grad_batches=cfg.get('accumulate_grad_batches', 1),
                       callbacks=[early_stop_callback, checkpoint_callback, lr_monitor, mlflow_flush_callback],
-                      enable_progress_bar=False,  # Disable tqdm to keep logs concise
+                      enable_progress_bar=True,  # Disable tqdm to keep logs concise
                       log_every_n_steps=50  # Log every 50 steps to see progress
                       )
 

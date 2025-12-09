@@ -8,6 +8,7 @@ from torch import Tensor, nn
 from torch.nn import functional as F
 
 from tsl.nn.models import BaseModel
+from lib.nn.layers.sampling_readout import SamplingReadoutLayer
 
 
 class RMSNorm(nn.Module):
@@ -19,8 +20,16 @@ class RMSNorm(nn.Module):
         self.eps = eps
 
     def forward(self, x: Tensor) -> Tensor:
-        norm = torch.mean(x.pow(2), dim=-1, keepdim=True)
-        return self.scale * x * torch.rsqrt(norm + self.eps)
+        # Replace NaN values with 0 to prevent propagation
+        x = torch.where(torch.isnan(x), torch.zeros_like(x), x)
+        # Cast to float32 for numerical stability during norm computation
+        dtype = x.dtype
+        x_fp32 = x.float()
+        norm = torch.mean(x_fp32.pow(2), dim=-1, keepdim=True)
+        # Use larger eps and clamp norm to prevent numerical issues
+        norm = torch.clamp(norm, min=self.eps)
+        result = x_fp32 * torch.rsqrt(norm)
+        return self.scale * result.to(dtype)
 
 
 class RMSNormTransformerLayer(nn.Module):
@@ -70,7 +79,8 @@ class LongTermFeatureEncoder(nn.Module):
         self.patch_len = patch_len
         self.max_patches = max_patches
         self.patch_embed = nn.Linear(patch_len * hidden_dim, hidden_dim)
-        self.positional = nn.Parameter(torch.randn(1, max_patches, hidden_dim))
+        # Scale positional embeddings properly for numerical stability
+        self.positional = nn.Parameter(torch.randn(1, max_patches, hidden_dim) * (1.0 / math.sqrt(hidden_dim)))
         self.dropout = nn.Dropout(dropout)
         self.layers = nn.ModuleList(
             RMSNormTransformerLayer(hidden_dim, num_heads, ff_dim, dropout) for _ in range(num_layers)
@@ -110,16 +120,34 @@ class GraphStructureLearner(nn.Module):
         self.symmetric = symmetric
 
     def forward(self, node_repr: Tensor) -> Tensor:
+        # Handle NaN in input
+        node_repr = torch.where(torch.isnan(node_repr), torch.zeros_like(node_repr), node_repr)
+
         q = self.q_proj(node_repr)
         k = self.k_proj(node_repr)
+
+        # Clamp scores to prevent extreme values
         scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(q.size(-1))
+        scores = torch.clamp(scores, min=-50.0, max=50.0)
+
         attention = torch.softmax(scores / max(self.tau, 1e-6), dim=-1)
+
+        # Replace any NaN in attention with uniform distribution
+        nan_mask = torch.isnan(attention)
+        if nan_mask.any():
+            uniform_val = 1.0 / attention.size(-1)
+            attention = torch.where(nan_mask, torch.full_like(attention, uniform_val), attention)
+
         if self.knn is not None and self.knn < attention.size(-1):
             topk = torch.topk(attention, self.knn, dim=-1).indices
             mask = torch.zeros_like(attention)
             mask.scatter_(-1, topk, 1.0)
             attention = attention * mask
-            attention = attention / (attention.sum(dim=-1, keepdim=True) + 1e-6)
+            # Renormalize with proper handling of zero sums
+            row_sum = attention.sum(dim=-1, keepdim=True)
+            row_sum = torch.clamp(row_sum, min=1e-6)
+            attention = attention / row_sum
+
         if self.symmetric:
             attention = 0.5 * (attention + attention.transpose(-1, -2))
         return attention
@@ -180,15 +208,34 @@ class DynamicNodeAttention(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, node_state: Tensor, adjacency: Optional[Tensor]) -> Tensor:
+        # Handle NaN in input
+        node_state = torch.where(torch.isnan(node_state), torch.zeros_like(node_state), node_state)
+
         b, n, _ = node_state.shape
         q = self.q_proj(node_state).view(b, n, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(node_state).view(b, n, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(node_state).view(b, n, self.num_heads, self.head_dim).transpose(1, 2)
+
         scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(self.head_dim)
+
         if adjacency is not None:
-            log_adj = torch.log(adjacency + 1e-6)
+            # Clamp adjacency to avoid very negative log values
+            adj_clamped = adjacency.clamp(min=1e-4, max=1.0)
+            log_adj = torch.log(adj_clamped)
+            # Clamp log values to prevent extreme negative values
+            log_adj = torch.clamp(log_adj, min=-10.0)
             scores = scores + log_adj.unsqueeze(1)
+
+        # Clamp scores before softmax to prevent overflow/underflow
+        scores = torch.clamp(scores, min=-50.0, max=50.0)
         attn = torch.softmax(scores, dim=-1)
+
+        # Replace any NaN in attention
+        nan_mask = torch.isnan(attn)
+        if nan_mask.any():
+            uniform_val = 1.0 / n
+            attn = torch.where(nan_mask, torch.full_like(attn, uniform_val), attn)
+
         attn = self.dropout(attn)
         out = torch.matmul(attn, v)
         out = out.transpose(1, 2).contiguous().view(b, n, self.hidden_dim)
@@ -290,17 +337,36 @@ class AttentionLongTermSTGNN(BaseModel):
         )
 
         fusion_dim = hidden_dim * 2
+        # Intermediate readout size for sampling layer
+        readout_hidden = (hidden_dim + self.output_size) // 2
         self.readout = nn.Sequential(
             nn.Linear(fusion_dim, fusion_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(fusion_dim, horizon * self.output_size),
+            nn.Linear(fusion_dim, horizon * readout_hidden),
+        )
+        self.readout_hidden = readout_hidden
+
+        # Use proper learned sampling layer for probabilistic output
+        self.sample_decoder = SamplingReadoutLayer(
+            input_size=readout_hidden,
+            output_size=self.output_size,
+            n_nodes=n_nodes,
+            horizon=horizon,
+            noise_mode='lin',
+            pre_activation='elu',
         )
 
     @staticmethod
     def _merge_features(x: Tensor, u: Optional[Tensor]) -> Tensor:
+        # Replace NaN values with 0 in input
+        x = torch.where(torch.isnan(x), torch.zeros_like(x), x)
+
         if u is None:
             return x
+        # Replace NaN in exogenous features as well
+        u = torch.where(torch.isnan(u), torch.zeros_like(u), u)
+
         if u.dim() == 3:
             u = u.unsqueeze(2).expand(-1, -1, x.size(2), -1)
         elif u.dim() == 4 and u.size(2) == 1:
@@ -348,14 +414,11 @@ class AttentionLongTermSTGNN(BaseModel):
             n = features.size(1)
 
         out = self.readout(features.view(-1, features.size(-1)))
-        out = out.view(b, n, self.horizon, self.output_size)
-        out = out.permute(0, 2, 1, 3)
-        
-        # Generate samples if mc_samples is provided
-        if mc_samples is not None:
-            sigma = out.std(dim=(1, 2), keepdim=True).clamp(min=1e-6)
-            noise_shape = (mc_samples, b, self.horizon, n, self.output_size)
-            out = out.unsqueeze(0) + sigma * torch.randn(*noise_shape, device=out.device)
-        
+        out = out.view(b, n, self.horizon, self.readout_hidden)
+        out = out.permute(0, 2, 1, 3)  # (b, horizon, n, readout_hidden)
+
+        # Use learned sampling layer for probabilistic output
+        out = self.sample_decoder(out, mc_samples=mc_samples)
+
         return out
 
