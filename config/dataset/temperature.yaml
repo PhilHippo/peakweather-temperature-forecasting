@@ -9,9 +9,16 @@ dataset:
     root: ./PeakWeatherDataset
     target_channels:
       - temperature
-    covariate_channels: other
+    # Explicitly list covariates, excluding all wind parameters
+    # This prevents the library from trying to compute wind components
+    covariate_channels:
+      - humidity
+      - precipitation
+      - pressure
+      - sunshine
     freq: h
-    station_type: meteo_station
+    # Include both station types - ~40 rain gauges have temperature data
+    # station_type: meteo_station
 
   splitting:
     first_val_ts: [2024, 1, 1]
@@ -28,7 +35,6 @@ dataset:
   covariates:
     year: true   # Annual cycle (critical for temperature)
     day: true    # Daily cycle (diurnal variation)
-    weekday: false
     mask: true
     u_mask: true
     v: true      # Include static node features
@@ -38,11 +44,11 @@ dataset:
     - latitude
     - longitude
     - station_height     # Altitude is crucial for temperature
-    - dem
-    - ASPECT_2000M_SIGRATIO1      # Sun exposure
-    - ASPECT_10000M_SIGRATIO1
-    - SLOPE_2000M_SIGRATIO1
-    - SLOPE_10000M_SIGRATIO1
+    - dem                 # Digital Elevation Model
+    - ASPECT_2000M_SIGRATIO1      # Sun exposure (2km scale)
+    - ASPECT_10000M_SIGRATIO1     # Sun exposure (10km scale)
+    - SLOPE_2000M_SIGRATIO1       # Terrain slope (2km)
+    - SLOPE_10000M_SIGRATIO1      # Terrain slope (10km)
     - TPI_2000M                   # Topographic Position Index (valley vs ridge)
     - TPI_10000M
 
@@ -57,3 +63,14 @@ scaler:
   method: Standard
   axis: global    # Scale globally across all nodes (some nodes have 0 valid timesteps)
   scale_target: true
+
+#### Test Evaluation Subsets ##################################################
+# Specify which station subsets to evaluate during testing
+# Available subsets:
+#   - meteo_only: Only meteo stations (191 stations)
+#   - rain_gauge_with_temp: Only rain gauges that have temperature data (~40 stations)
+#   - all_with_temp: All stations with temperature data (meteo + rain gauges with temp)
+#   - meteo_and_rain_gauge_with_temp: Same as all_with_temp (alias)
+test_subsets:
+  - meteo_only              # Test on meteo stations only
+  - all_with_temp           # Test on all stations with temperature data

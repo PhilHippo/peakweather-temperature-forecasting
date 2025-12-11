@@ -19,8 +19,8 @@ workers: 4
 #### Training params ##########################################################
 epochs: 120
 patience: 25
-batch_size: 16  # Physical batch size per GPU
-accumulate_grad_batches: 2  # Effective batch size = batch_size * accumulate_grad_batches = 32
+batch_size: 64  # Physical batch size per GPU
+accumulate_grad_batches: 1  # Effective batch size = batch_size * accumulate_grad_batches = 32
 grad_clip_val: 5
 
 loss_fn: ens  
@@ -28,7 +28,8 @@ loss_fn: ens
 sampling:
   mc_samples_train: 16
   mc_samples_eval: 11
-  mc_samples_test: 100
+  # Lowered from 100 -> 20 to avoid OOM during EnergyScore test evaluation
+  mc_samples_test: 20
 
 scaler:
   method: Standard

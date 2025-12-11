@@ -1,6 +1,8 @@
 import os
 import sys
+from typing import Dict, List, Optional, Tuple
 import numpy as np
+import pandas as pd
 import omegaconf
 import torch
 from omegaconf import DictConfig
@@ -33,40 +35,46 @@ LEARNABLE_MODELS = {
 
 # Baseline models (no training required)
 BASELINE_MODELS = {
-    'naive': models.NaiveModel,
+    'naive': models.NaiveModel, # last value prediction
     'moving_avg': models.MovingAverageModel,
-    'icon': models.ICONDummyModel,
+    'icon': models.ICONDummyModel, # ICON NWP model
 }
 
 MODEL_REGISTRY = {**LEARNABLE_MODELS, **BASELINE_MODELS}
 
 
 class MLflowFlushCallback(Callback):
-    """Callback to flush MLflow metrics in real-time after each epoch."""
+    """Callback to flush MLflow metrics in real-time."""
+    
+    def __init__(self, flush_every_n_steps: int = 100):
+        super().__init__()
+        self.flush_every_n_steps = flush_every_n_steps
     
     def _flush_mlflow(self, logger):
         """Flush MLflow run to ensure metrics are written immediately."""
         if isinstance(logger, MLFlowLogger):
             try:
-                # Get the MLflow run ID
-                run_id = logger.run_id
-                if run_id:
-                    # Set tracking URI if needed
-                    tracking_uri = logger.tracking_uri or './mlruns'
-                    mlflow.set_tracking_uri(tracking_uri)
+                # Force save/finalize metrics if available
+                if hasattr(logger, 'save'):
+                    logger.save()
+                
+                # Also try to finalize metrics
+                if hasattr(logger, 'finalize'):
+                    logger.finalize('success')
+                
+                # Force the experiment to flush
+                if hasattr(logger, 'experiment') and logger.experiment:
+                    # Log a dummy param to force flush (will be overwritten)
+                    pass
                     
-                    # Get the active run and ensure it's synced
-                    # Accessing the run forces a sync with the backend
-                    client = mlflow.tracking.MlflowClient(tracking_uri=tracking_uri)
-                    run = client.get_run(run_id)
-                    
-                    # Force file system sync by accessing run data
-                    # This ensures the file backend writes are flushed and visible in real-time
-                    _ = run.info
-                    _ = run.data
             except Exception:
-                # Silently fail if flush doesn't work
                 pass
+    
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        """Flush MLflow periodically during training."""
+        if (trainer.global_step + 1) % self.flush_every_n_steps == 0:
+            for logger in trainer.loggers:
+                self._flush_mlflow(logger)
     
     def on_train_epoch_end(self, trainer, pl_module):
         """Flush MLflow after each training epoch."""
@@ -95,6 +103,114 @@ def is_baseline_model(model_str: str) -> bool:
 def is_icon_model(model_str: str) -> bool:
     """Check if model is the ICON NWP baseline."""
     return model_str == 'icon'
+
+
+def identify_station_subsets(
+    dataset: PeakWeather,
+    df: pd.DataFrame,
+    mask: np.ndarray
+) -> Dict[str, np.ndarray]:
+    """
+    Identify different station subsets for evaluation.
+    
+    Returns a dict with boolean masks for each subset:
+    - 'meteo_only': Only meteo stations
+    - 'rain_gauge_with_temp': Rain gauges that have temperature data
+    - 'rain_gauge_no_temp': Rain gauges without temperature data
+    - 'all_with_temp': All stations with temperature data (meteo + rain gauges with temp)
+    
+    Each mask is a 1D boolean array of shape (n_nodes,).
+    """
+    stations_table = dataset.stations_table
+    
+    # Get station names from dataframe columns
+    if isinstance(df.columns, pd.MultiIndex):
+        stations = df.columns.get_level_values(0).unique().tolist()
+    else:
+        stations = list(df.columns)
+    
+    n_nodes = len(stations)
+    
+    # Initialize masks
+    is_meteo = np.zeros(n_nodes, dtype=bool)
+    is_rain_gauge = np.zeros(n_nodes, dtype=bool)
+    has_temp_data = np.zeros(n_nodes, dtype=bool)
+    
+    # Check station types and temperature data availability
+    for i, station in enumerate(stations):
+        # Check station type
+        if station in stations_table.index:
+            station_type = stations_table.loc[station, 'station_type'] if 'station_type' in stations_table.columns else 'unknown'
+            if station_type == 'meteo_station':
+                is_meteo[i] = True
+            elif station_type == 'rain_gauge':
+                is_rain_gauge[i] = True
+            else:
+                # Unknown type - assume meteo for safety
+                is_meteo[i] = True
+        else:
+            # Station not in table - assume meteo
+            is_meteo[i] = True
+        
+        # Check if station has temperature data (not all zeros in mask)
+        # Mask shape is (T, N, C) or (T, N) - we want column i
+        if mask.ndim == 3:
+            station_mask = mask[:, i, :]
+        else:
+            station_mask = mask[:, i]
+        
+        # Has temp data if any value in the mask is True/1
+        has_temp_data[i] = station_mask.sum() > 0
+    
+    # Create subset masks
+    subsets = {
+        'meteo_only': is_meteo,
+        'rain_gauge_with_temp': is_rain_gauge & has_temp_data,
+        'rain_gauge_no_temp': is_rain_gauge & ~has_temp_data,
+        'all_with_temp': has_temp_data,
+        'meteo_and_rain_gauge_with_temp': is_meteo | (is_rain_gauge & has_temp_data),
+    }
+    
+    return subsets
+
+
+def print_station_summary(subsets: Dict[str, np.ndarray]) -> None:
+    """Print summary of station subsets."""
+    print(f"\n{'='*80}")
+    print("Station Subset Analysis")
+    print('='*80)
+    print(f"  Meteo stations:                    {subsets['meteo_only'].sum():3d}")
+    print(f"  Rain gauges with temperature:      {subsets['rain_gauge_with_temp'].sum():3d}")
+    print(f"  Rain gauges without temperature:   {subsets['rain_gauge_no_temp'].sum():3d}")
+    print(f"  Total stations with temperature:   {subsets['all_with_temp'].sum():3d}")
+    print(f"  Total nodes in dataset:            {len(subsets['meteo_only']):3d}")
+    print('='*80 + '\n')
+
+
+def create_node_mask_for_metrics(
+    node_indices: np.ndarray,
+    batch_size: int,
+    horizon: int,
+    n_nodes: int,
+    n_channels: int = 1
+) -> torch.Tensor:
+    """
+    Create a node mask tensor that can be multiplied with the existing mask
+    to filter predictions to specific nodes.
+    
+    Args:
+        node_indices: Boolean array of shape (n_nodes,) indicating which nodes to include
+        batch_size: Batch size
+        horizon: Prediction horizon
+        n_nodes: Total number of nodes
+        n_channels: Number of output channels
+    
+    Returns:
+        Tensor of shape (batch_size, horizon, n_nodes, n_channels) with 1s for included nodes
+    """
+    node_mask = torch.zeros(1, 1, n_nodes, 1)
+    node_mask[0, 0, node_indices, 0] = 1.0
+    return node_mask.expand(batch_size, horizon, n_nodes, n_channels)
 
 
 def run(cfg: DictConfig):
@@ -137,26 +253,20 @@ def run(cfg: DictConfig):
     mask = dataset.get_mask()
 
     # Get covariates
-    # Similar to run_wind_prediction.py, but simplified for temperature
     u = []
-    if cfg.dataset.get('covariates', {}).get('year', False):
-        u.append(dataset.datetime_encoded('year').values)
-    if cfg.dataset.get('covariates', {}).get('day', False):
-        u.append(dataset.datetime_encoded('day').values)
-    if cfg.dataset.get('covariates', {}).get('weekday', False):
-        u.append(dataset.datetime_onehot('weekday').values)
-    if cfg.dataset.get('covariates', {}).get('mask', False):
-        u.append(mask.astype(np.float32))
+
+    u.append(dataset.datetime_encoded('year').values)
+    u.append(dataset.datetime_encoded('day').values)
+    u.append(mask.astype(np.float32))
         
     # Add 'u' from dataset (which contains other weather vars if configured)
-    # Extract the actual numpy array using get_frame, similar to run_wind_prediction.py
+    # Extract the actual numpy array using get_frame
     if 'u' in dataset.covariates:
         other_channels = dataset.get_frame('u', return_pattern=False)
         u.append(other_channels)
-        if cfg.dataset.get('covariates', {}).get('u_mask', False):
-            u_mask = dataset.get_frame('u_mask', return_pattern=False)
-            u.append(u_mask)
-        
+        u_mask = dataset.get_frame('u_mask', return_pattern=False)
+        u.append(u_mask)
+    
     # Concatenate covariates
     if len(u):
         ndim = max(u_.ndim for u_ in u)
@@ -170,8 +280,8 @@ def run(cfg: DictConfig):
     covs = {}
     if u is not None:
         covs['u'] = u
-        
-    # Add static variables if present (e.g. topography)
+    
+    # Add static variables if present
     # In PeakWeather dataset.py, static vars might be in stations_table or separate.
     # run_wind_prediction.py added 'v' manually from stations_table.
     if cfg.dataset.get('static_attributes', None):
@@ -204,8 +314,13 @@ def run(cfg: DictConfig):
                                           window=cfg.window,
                                           stride=cfg.stride)
     
-    # Sanity check for NaN/Inf in data
+    # Identify station subsets (meteo vs rain gauges with/without temperature)
     data_df = dataset.dataframe()
+    mask_arr = mask.values if hasattr(mask, 'values') else mask
+    station_subsets = identify_station_subsets(dataset, data_df, mask_arr)
+    print_station_summary(station_subsets)
+    
+    # Sanity check for NaN/Inf in data
     if np.isnan(data_df.values).any():
         logger.warning(f"Found {np.isnan(data_df.values).sum()} NaN values in target data")
     if np.isinf(data_df.values).any():
@@ -358,8 +473,8 @@ def run(cfg: DictConfig):
     mlflow_tracking_uri = cfg.get('mlflow_tracking_uri', './mlruns')
     exp_logger = MLFlowLogger(experiment_name=cfg.experiment_name, tracking_uri=mlflow_tracking_uri)
     
-    # Create callback to flush MLflow in real-time
-    mlflow_flush_callback = MLflowFlushCallback()
+    # Create callback to flush MLflow in real-time (flush every 100 steps)
+    mlflow_flush_callback = MLflowFlushCallback(flush_every_n_steps=100)
 
     # Print MLflow tracking URL (it's possible to use a remote or custom MLflow server)
     if mlflow_tracking_uri is None or mlflow_tracking_uri == './mlruns' or mlflow_tracking_uri.startswith('file://'):
@@ -390,7 +505,7 @@ def run(cfg: DictConfig):
                       accumulate_grad_batches=cfg.get('accumulate_grad_batches', 1),
                       callbacks=[early_stop_callback, checkpoint_callback, lr_monitor, mlflow_flush_callback],
                       enable_progress_bar=True,  # Disable tqdm to keep logs concise
-                      log_every_n_steps=50  # Log every 50 steps to see progress
+                      log_every_n_steps=100  # Log every 100 steps
                       )
 
     load_model_path = cfg.get('load_model_path')
@@ -484,7 +599,135 @@ def run(cfg: DictConfig):
     
     # Standard test evaluation (skip for ICON model since it uses custom evaluation)
     if not is_icon:
+        # Run standard test on all nodes
+        print(f"\n{'='*80}")
+        print("Test Evaluation: ALL NODES")
+        print('='*80)
         trainer.test(predictor, dataloaders=dm.test_dataloader())
+        
+        # Run subset-specific evaluations
+        test_subsets = cfg.get('test_subsets', ['meteo_only', 'all_with_temp'])
+        
+        if test_subsets:
+            device = 'cuda' if torch.cuda.is_available() else 'cpu'
+            predictor.to(device)
+            
+            for subset_name in test_subsets:
+                if subset_name not in station_subsets:
+                    logger.warning(f"Unknown subset '{subset_name}', skipping")
+                    continue
+                
+                node_mask = station_subsets[subset_name]
+                n_nodes_in_subset = node_mask.sum()
+                
+                if n_nodes_in_subset == 0:
+                    logger.warning(f"Subset '{subset_name}' has no nodes, skipping")
+                    continue
+                
+                print(f"\n{'='*80}")
+                print(f"Test Evaluation: {subset_name.upper()} ({n_nodes_in_subset} nodes)")
+                print('='*80)
+                
+                # Create fresh metrics for this subset and move to device
+                # Include horizon-specific metrics (same as main evaluation)
+                horizon_at = [1, 3, 6, 12, 18, 24]
+                subset_point_metrics = {
+                    'mae': torch_metrics.MaskedMAE().to(device),
+                    **{f'mae_{h:d}h': torch_metrics.MaskedMAE(at=h-1).to(device) for h in horizon_at if h <= cfg.horizon},
+                    'mse': torch_metrics.MaskedMSE().to(device),
+                }
+                subset_sample_metrics = {
+                    'smae': lib.metrics.SampleMAE().to(device),
+                    **{f'smae_{h:d}h': lib.metrics.SampleMAE(at=h-1).to(device) for h in horizon_at if h <= cfg.horizon},
+                    'smse': lib.metrics.SampleMSE().to(device),
+                    'ens': lib.metrics.EnergyScore().to(device),
+                    **{f'ens_{h:d}h': lib.metrics.EnergyScore(at=h-1).to(device) for h in horizon_at if h <= cfg.horizon},
+                }
+                
+                # Combine metrics based on predictor type
+                if isinstance(predictor, SamplingPredictor):
+                    subset_metrics = {**subset_point_metrics, **subset_sample_metrics}
+                else:
+                    subset_metrics = subset_point_metrics
+                
+                # Reset metrics
+                for m in subset_metrics.values():
+                    m.reset()
+                
+                # Evaluate on test set with node filtering
+                test_loader = dm.test_dataloader()
+                node_mask_tensor = torch.tensor(node_mask, dtype=torch.bool, device=device)
+                
+                with torch.no_grad():
+                    for batch in test_loader:
+                        # Move batch to device
+                        batch = batch.to(device)
+                        
+                        # Get predictions
+                        if isinstance(predictor, SamplingPredictor):
+                            # Sample predictions for probabilistic models
+                            y_hat = predictor.predict_step(batch, batch_idx=0)
+                        else:
+                            y_hat = predictor.predict_step(batch, batch_idx=0)
+                        
+                        # Get target and mask
+                        y = batch.y
+                        batch_mask = batch.mask
+                        
+                        # Apply node subset mask
+                        # Expand node_mask to match batch dimensions: (B, H, N, C)
+                        node_mask_expanded = node_mask_tensor.view(1, 1, -1, 1).expand_as(batch_mask)
+                        combined_mask = batch_mask & node_mask_expanded
+
+                        # Ensure y_hat is a tensor (predict_step may return tuple/list/dict)
+                        if isinstance(y_hat, (list, tuple)):
+                            y_hat = y_hat[0]
+                        elif isinstance(y_hat, dict):
+                            # common key names; fallback to first value
+                            y_hat = y_hat.get('y_hat', next(iter(y_hat.values())))
+
+                        # Slice to selected nodes (handles both 4D and 5D via ellipsis)
+                        y_hat_subset = y_hat[..., node_mask_tensor, :]
+                        y_subset = y[..., node_mask_tensor, :]
+                        mask_subset = combined_mask[..., node_mask_tensor, :]
+                        
+                        # Update metrics with filtered data
+                        # SampleMetric expects: y_hat [S, B, H, N, C], y/mask [B, H, N, C]
+                        # Point metrics expect: y_hat [B, H, N, C], y/mask [B, H, N, C]
+                        is_sampled = y_hat_subset.dim() == 5 and y_subset.dim() == 4
+                        
+                        for name, metric in subset_metrics.items():
+                            if name in subset_sample_metrics:
+                                # SampleMetric: pass as-is (different shapes expected)
+                                metric.update(y_hat_subset, y_subset, mask_subset)
+                            else:
+                                # Point metric: reduce samples to mean
+                                if is_sampled:
+                                    y_hat_point = y_hat_subset.mean(dim=0)
+                                else:
+                                    y_hat_point = y_hat_subset
+                                metric.update(y_hat_point, y_subset, mask_subset)
+                
+                # Compute and print results
+                print(f"  Results for {subset_name}:")
+                for name, metric in subset_metrics.items():
+                    value = metric.compute()
+                    if isinstance(value, torch.Tensor):
+                        value = value.item()
+                    print(f"    test_{name}: {value:.4f}")
+                    
+                    # Log to MLflow
+                    if hasattr(exp_logger, 'experiment') and exp_logger.experiment:
+                        try:
+                            exp_logger.experiment.log_metric(
+                                exp_logger.run_id,
+                                f"test_{subset_name}_{name}",
+                                value
+                            )
+                        except Exception:
+                            pass
+                
+                print('='*80)
 
     return result
 
