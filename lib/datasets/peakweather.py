@@ -67,6 +67,23 @@ class PeakWeather(DatetimeDataset):
         if not isinstance(extended_nwp_vars, list) or len(extended_nwp_vars)==0: 
             extended_nwp_vars = "none"
 
+        # Only compute wind UV components if wind parameters are actually requested
+        # This prevents errors when loading rain gauge stations (which don't have wind data)
+        wind_params = {'wind_direction', 'wind_speed', 'wind_gust'}
+        compute_uv = False
+        if channels is not None:
+            # Check if any wind parameters are in the explicitly requested channels
+            requested_params = set(ensure_list(channels))
+            if wind_params.intersection(requested_params):
+                compute_uv = True
+        elif target_channels == "all":
+            # If loading all parameters, we'll compute UV (assumes meteo stations have wind data)
+            compute_uv = True
+        elif covariate_channels == "other":
+            # When using "other", we'll exclude wind params later, so don't compute UV
+            # This is safer for rain gauge compatibility
+            compute_uv = False
+
         ds = PeakWeatherDataset(root=root,
                                pad_missing_variables=True,
                                parameters=channels,
@@ -74,7 +91,7 @@ class PeakWeather(DatetimeDataset):
                                extended_topo_vars=extended_topo_vars,
                                imputation_method=imputation_method,
                                interpolation_method=interpolation_method,
-                               compute_uv=True,
+                               compute_uv=compute_uv,
                                freq=freq,
                                station_type=station_type,
                                extended_nwp_vars=extended_nwp_vars)
@@ -102,11 +119,14 @@ class PeakWeather(DatetimeDataset):
             covar_params = pd.Index([])
         elif covariate_channels == "other":
             covar_params = ds.parameters.difference(target_params)
-            wind_params = {'wind_direction', 'wind_speed', 'wind_u', 'wind_v'}
-            if target_params.isin(wind_params).any():
-                covar_params = covar_params.difference(wind_params)
+            # Always exclude wind parameters to avoid issues with rain gauges
+            wind_params = {'wind_direction', 'wind_speed', 'wind_u', 'wind_v', 'wind_gust'}
+            covar_params = covar_params.difference(wind_params)
         else:
             covar_params = pd.Index(ensure_list(covariate_channels))
+            # Also exclude wind parameters if explicitly listed (safety check)
+            wind_params = {'wind_direction', 'wind_speed', 'wind_u', 'wind_v', 'wind_gust'}
+            covar_params = covar_params.difference(wind_params)
 
         assert covar_params.isin(ds.parameters).all(), \
             (f"Covariate channels {covar_params.difference(ds.parameters)} not "
