@@ -10,3 +10,8 @@ model:
     time_layers: 2
     activation: elu
     noise_mode: lin
+
+# RNN models are more memory-intensive than TCN due to sequential processing
+# Reduce batch size and increase gradient accumulation to maintain effective batch size
+batch_size: 32
+accumulate_grad_batches: 2  # Effective batch size = 16 * 4 = 64

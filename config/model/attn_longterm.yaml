@@ -1,23 +1,25 @@
 # @package _global_
 
 #### Model params #############################################################
+# AttentionLongTermSTGNN: Attention-based STGNN with Long-Term Dependencies
+# Based on: "Attention-Based Spatial-Temporal Graph Neural Network With Long-Term
+# Dependencies for Traffic Speed Prediction" (IEEE T-ITS, 2025)
+#
+# Key features:
+# - Gumbel-Sigmoid graph structure learning with KNN regularization
+# - STAWnet backbone (Gated TCN + Dynamic Attention Network)
 model:
   name: attn_longterm
   hparams:
     hidden_dim: 128
-    patch_len: 12
-    max_patches: 28
-    long_layers: 4
-    long_heads: 4
-    long_ff_size: 256
     staw_kernel_size: 3
     staw_dilations: [1, 2, 4]
     staw_attn_heads: 4
-    graph_knn: 8
-    graph_tau: 0.7
-    dropout: 0.2
+    graph_knn: 10
+    graph_tau: 1.0
+    dropout: 0.1
 
-window: 72 
+window: 72
 horizon: 24
 stride: 1
 loss_fn: ens

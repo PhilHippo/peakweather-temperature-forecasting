@@ -3,8 +3,6 @@ from .learnable_models import (
     RNNModel,
     STGNN,
     AttentionLongTermSTGNN,
-    Model3,
-    Model3Old
 )
 from .baselines import (
     ICONData,

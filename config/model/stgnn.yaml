@@ -13,3 +13,9 @@ model:
     activation: elu
     noise_mode: lin
     time_skip_connect: true
+
+# STGNN uses GRU-based RNN for temporal encoding, which is memory-intensive
+# Reduce batch size and increase gradient accumulation to maintain effective batch size
+batch_size: 32
+accumulate_grad_batches: 2  # Effective batch size = 16 * 4 = 64
+  

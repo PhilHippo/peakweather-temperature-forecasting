@@ -134,7 +134,7 @@ python -m experiments.run_temperature_prediction \
     loss_fn=ens \
     sampling.mc_samples_train=16 \
     sampling.mc_samples_eval=11 \
-    sampling.mc_samples_test=100
+    sampling.mc_samples_test=20  # lower test MC samples to avoid OOM
 ```
 
 > **Note:** When using `loss_fn=ens` (Energy Score), learnable models generate Monte Carlo samples to estimate prediction uncertainty. Baselines are deterministic only and should be evaluated with `loss_fn=mae`.
@@ -147,7 +147,8 @@ python -m experiments.run_temperature_prediction \
 python -m experiments.run_temperature_prediction \
     dataset=temperature \
     model=tcn \
-    load_model_path=logs/Temperature/tcn/2025-11-20/17-53-24/epoch_61-step_118792.ckpt
+    load_model_path=TCN-all-nodes/epoch_68-step_66033.ckpt \
+    sampling.mc_samples_test=20  # safe value for EnergyScore test
 ```
 
 When `load_model_path` is specified, training is skipped and the model is evaluated directly on the test set.

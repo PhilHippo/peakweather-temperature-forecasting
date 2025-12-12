@@ -1,16 +1,13 @@
 import os
-import sys
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
-import omegaconf
 import torch
 from omegaconf import DictConfig
 from pytorch_lightning import Trainer
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor, Callback
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
 from pytorch_lightning.loggers import MLFlowLogger
 import pytorch_lightning as pl
-import mlflow
 from tsl import logger
 from tsl.data import SpatioTemporalDataset, SpatioTemporalDataModule
 from tsl.data.preprocessing import scalers
@@ -23,17 +20,14 @@ from lib.nn import models
 import lib.metrics
 from lib.nn.predictors import Predictor, SamplingPredictor
 
-# Learnable models (require training)
+# Model registries
 LEARNABLE_MODELS = {
     'tcn': models.TCNModel,
     'rnn': models.RNNModel,
     'stgnn': models.STGNN,
     'attn_longterm': models.AttentionLongTermSTGNN,
-    'model3': models.Model3,
-    'model3_old': models.Model3Old,
 }
 
-# Baseline models (no training required)
 BASELINE_MODELS = {
     'naive': models.NaiveModel, # last value prediction
     'moving_avg': models.MovingAverageModel,
@@ -41,50 +35,6 @@ BASELINE_MODELS = {
 }
 
 MODEL_REGISTRY = {**LEARNABLE_MODELS, **BASELINE_MODELS}
-
-
-class MLflowFlushCallback(Callback):
-    """Callback to flush MLflow metrics in real-time."""
-    
-    def __init__(self, flush_every_n_steps: int = 100):
-        super().__init__()
-        self.flush_every_n_steps = flush_every_n_steps
-    
-    def _flush_mlflow(self, logger):
-        """Flush MLflow run to ensure metrics are written immediately."""
-        if isinstance(logger, MLFlowLogger):
-            try:
-                # Force save/finalize metrics if available
-                if hasattr(logger, 'save'):
-                    logger.save()
-                
-                # Also try to finalize metrics
-                if hasattr(logger, 'finalize'):
-                    logger.finalize('success')
-                
-                # Force the experiment to flush
-                if hasattr(logger, 'experiment') and logger.experiment:
-                    # Log a dummy param to force flush (will be overwritten)
-                    pass
-                    
-            except Exception:
-                pass
-    
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        """Flush MLflow periodically during training."""
-        if (trainer.global_step + 1) % self.flush_every_n_steps == 0:
-            for logger in trainer.loggers:
-                self._flush_mlflow(logger)
-    
-    def on_train_epoch_end(self, trainer, pl_module):
-        """Flush MLflow after each training epoch."""
-        for logger in trainer.loggers:
-            self._flush_mlflow(logger)
-    
-    def on_validation_epoch_end(self, trainer, pl_module):
-        """Flush MLflow after each validation epoch."""
-        for logger in trainer.loggers:
-            self._flush_mlflow(logger)
 
 
 def get_model_class(model_str: str):
@@ -176,15 +126,10 @@ def identify_station_subsets(
 
 def print_station_summary(subsets: Dict[str, np.ndarray]) -> None:
     """Print summary of station subsets."""
-    print(f"\n{'='*80}")
-    print("Station Subset Analysis")
-    print('='*80)
-    print(f"  Meteo stations:                    {subsets['meteo_only'].sum():3d}")
-    print(f"  Rain gauges with temperature:      {subsets['rain_gauge_with_temp'].sum():3d}")
-    print(f"  Rain gauges without temperature:   {subsets['rain_gauge_no_temp'].sum():3d}")
-    print(f"  Total stations with temperature:   {subsets['all_with_temp'].sum():3d}")
-    print(f"  Total nodes in dataset:            {len(subsets['meteo_only']):3d}")
-    print('='*80 + '\n')
+    print(f"\nStation subsets: meteo={subsets['meteo_only'].sum()}, "
+          f"rain_gauge_w_temp={subsets['rain_gauge_with_temp'].sum()}, "
+          f"total_w_temp={subsets['all_with_temp'].sum()}, "
+          f"total_nodes={len(subsets['meteo_only'])}")
 
 
 def create_node_mask_for_metrics(
@@ -214,84 +159,51 @@ def create_node_mask_for_metrics(
 
 
 def run(cfg: DictConfig):
-    ########################################
-    # Set Random Seed                      #
-    ########################################
-    
-    # Get seed from config (can be set via command line: seed=1)
-    # If not provided, Hydra will auto-generate one in cfg.run.seed
-    seed = cfg.get('seed', None)
-    if seed is None:
-        # Fall back to Hydra's auto-generated seed if available
-        seed = cfg.get('run', {}).get('seed', None)
-    
+    # Set random seed
+    seed = cfg.get('seed') or cfg.get('run', {}).get('seed')
     if seed is not None:
-        # Set seed for reproducibility
         pl.seed_everything(seed, workers=True)
-        logger.info(f"Seed set to {seed}")
+        logger.info(f"Seed: {seed}")
     
     
     ########################################
     # Get Dataset                          #
     ########################################
     
-    # Check if we need ICON data
+    # Check if we are using ICON
     use_icon = is_icon_model(cfg.model.name) or cfg.get('nwp_test_set', False)
-    
-    # Prepare dataset params, adding ICON if needed
     dataset_params = dict(cfg.dataset.hparams)
     if use_icon:
-        # Ensure temperature ICON data is loaded
         dataset_params['extended_nwp_vars'] = ['temperature']
     
-    # Load dataset with explicit target and covariate separation
     dataset = PeakWeather(**dataset_params)
     
-    # Get connectivity
     adj = dataset.get_connectivity(**cfg.dataset.connectivity)
-    # Get mask
     mask = dataset.get_mask()
 
-    # Get covariates
-    u = []
-
-    u.append(dataset.datetime_encoded('year').values)
-    u.append(dataset.datetime_encoded('day').values)
-    u.append(mask.astype(np.float32))
-        
-    # Add 'u' from dataset (which contains other weather vars if configured)
-    # Extract the actual numpy array using get_frame
-    if 'u' in dataset.covariates:
-        other_channels = dataset.get_frame('u', return_pattern=False)
-        u.append(other_channels)
-        u_mask = dataset.get_frame('u_mask', return_pattern=False)
-        u.append(u_mask)
+    # Build temporal covariates
+    u = [dataset.datetime_encoded('year').values,
+         dataset.datetime_encoded('day').values,
+         mask.astype(np.float32)]
     
-    # Concatenate covariates
-    if len(u):
+    if 'u' in dataset.covariates:
+        u.append(dataset.get_frame('u', return_pattern=False))
+        u.append(dataset.get_frame('u_mask', return_pattern=False))
+    
+    if u:
         ndim = max(u_.ndim for u_ in u)
-        u = np.concatenate([np.repeat(u_[:, None], dataset.n_nodes, 1)
-                            if u_.ndim < ndim else u_
-                            for u_ in u], axis=-1)
+        u = np.concatenate([np.repeat(u_[:, None], dataset.n_nodes, 1) if u_.ndim < ndim else u_ for u_ in u], axis=-1)
     else:
         u = None
-
+        
     # Get static information
-    covs = {}
-    if u is not None:
-        covs['u'] = u
+    covs = {'u': u} if u is not None else {}
     
-    # Add static variables if present
-    # In PeakWeather dataset.py, static vars might be in stations_table or separate.
-    # run_wind_prediction.py added 'v' manually from stations_table.
-    if cfg.dataset.get('static_attributes', None):
+    # Static attributes
+    if cfg.dataset.get('static_attributes'):
         v = dataset.stations_table[[*cfg.dataset.static_attributes]]
-        # Standardize with safeguard against zero std
-        v_mean = v.mean(0)
-        v_std = v.std(0)
-        # Replace zero std with 1.0 to avoid division by zero
-        v_std = v_std.replace(0.0, 1.0)
-        v = (v - v_mean) / v_std
+        v_std = v.std(0).replace(0.0, 1.0)
+        v = (v - v.mean(0)) / v_std
         covs["v"] = v.values
 
     # Scale input features
@@ -321,24 +233,13 @@ def run(cfg: DictConfig):
     print_station_summary(station_subsets)
     
     # Sanity check for NaN/Inf in data
-    if np.isnan(data_df.values).any():
-        logger.warning(f"Found {np.isnan(data_df.values).sum()} NaN values in target data")
     if np.isinf(data_df.values).any():
-        logger.warning(f"Found {np.isinf(data_df.values).sum()} Inf values in target data")
-    
-    if 'u' in covs:
-        if np.isnan(covs['u']).any():
-            logger.warning(f"Found {np.isnan(covs['u']).sum()} NaN values in covariates")
-        if np.isinf(covs['u']).any():
-            raise ValueError(f"Found {np.isinf(covs['u']).sum()} Inf values in covariates - check data preprocessing!")
-    
-    if 'v' in covs:
-        if np.isnan(covs['v']).any():
-            logger.warning(f"Found {np.isnan(covs['v']).sum()} NaN values in static attributes")
-        if np.isinf(covs['v']).any():
-            raise ValueError(f"Found {np.isinf(covs['v']).sum()} Inf values in static attributes - check standardization!")
+        raise ValueError("Inf values in target data")
+    if 'u' in covs and np.isinf(covs['u']).any():
+        raise ValueError("Inf values in covariates")
+    if 'v' in covs and np.isinf(covs['v']).any():
+        raise ValueError("Inf values in static attributes")
 
-    print("Creating data module...")
     dm = SpatioTemporalDataModule(
         dataset=torch_dataset,
         scalers=transform,
@@ -398,45 +299,31 @@ def run(cfg: DictConfig):
     mae_at = [1, 3, 6, 12, 18, 24]
     point_metrics = {'mae': torch_metrics.MaskedMAE(),
                      **{f'mae_{h:d}h': torch_metrics.MaskedMAE(at=h-1) for h in mae_at if h <= cfg.horizon},
-                     'mse': torch_metrics.MaskedMSE(),
-                     }
+                     'mse': torch_metrics.MaskedMSE()}
     
     sample_metrics = {'smae': lib.metrics.SampleMAE(),
                       **{f'smae_{h:d}h': lib.metrics.SampleMAE(at=h-1) for h in mae_at if h <= cfg.horizon},
                       'smse': lib.metrics.SampleMSE(),
                       'ens': lib.metrics.EnergyScore(),
-                      **{f'ens_{h:d}h': lib.metrics.EnergyScore(at=h-1) for h in mae_at if h <= cfg.horizon},
-                      }
+                      **{f'ens_{h:d}h': lib.metrics.EnergyScore(at=h-1) for h in mae_at if h <= cfg.horizon}}
 
-    if cfg.get('lr_scheduler') is not None:
-        scheduler_class = getattr(torch.optim.lr_scheduler,
-                                  cfg.lr_scheduler.name)
+    scheduler_class, scheduler_kwargs = None, None
+    if cfg.get('lr_scheduler'):
+        scheduler_class = getattr(torch.optim.lr_scheduler, cfg.lr_scheduler.name)
         scheduler_kwargs = dict(cfg.lr_scheduler.hparams)
     else:
         scheduler_class = scheduler_kwargs = None
 
-    # Use regular Predictor for baseline models (deterministic), SamplingPredictor for learned models (probabilistic)
-    # Note: is_baseline_or_icon is already computed above when setting loss_fn
+
     if is_baseline_or_icon and not isinstance(loss_fn, lib.metrics.SampleMetric):
-        # Deterministic baseline models use regular Predictor with point metrics only
-        predictor_class = Predictor
-        log_metrics = point_metrics
-        predictor_kwargs = {}
-        monitored_metric = 'val_mae'
+        predictor_class, log_metrics, predictor_kwargs, monitored_metric = Predictor, point_metrics, {}, 'val_mae'
     else:
         # Learned models and ICON use SamplingPredictor for probabilistic evaluation
         predictor_class = SamplingPredictor
-        assert not point_metrics.keys() & sample_metrics.keys()
-        log_metrics = dict(**point_metrics, **sample_metrics)
+        log_metrics = {**point_metrics, **sample_metrics}
         predictor_kwargs = dict(**cfg.get('sampling', {}))
-        
-        # Monitor validation metric based on loss type
-        if isinstance(loss_fn, lib.metrics.SampleMetric):
-            monitored_metric = 'val_smae'
-        else:
-            monitored_metric = 'val_mae'
+        monitored_metric = 'val_smae' if isinstance(loss_fn, lib.metrics.SampleMetric) else 'val_mae'
     
-    # setup predictor
     predictor = predictor_class(
         model_class=model_cls,
         model_kwargs=model_kwargs,
@@ -472,30 +359,7 @@ def run(cfg: DictConfig):
     # Will place the logs in ./mlruns
     mlflow_tracking_uri = cfg.get('mlflow_tracking_uri', './mlruns')
     exp_logger = MLFlowLogger(experiment_name=cfg.experiment_name, tracking_uri=mlflow_tracking_uri)
-    
-    # Create callback to flush MLflow in real-time (flush every 100 steps)
-    mlflow_flush_callback = MLflowFlushCallback(flush_every_n_steps=100)
-
-    # Print MLflow tracking URL (it's possible to use a remote or custom MLflow server)
-    if mlflow_tracking_uri is None or mlflow_tracking_uri == './mlruns' or mlflow_tracking_uri.startswith('file://'):
-        # Local file-based tracking
-        abs_mlruns_path = os.path.abspath('./mlruns')
-        mlflow_url = f"file://{abs_mlruns_path}"
-        print(f"\n{'='*80}")
-        print(f"MLflow Tracking:")
-        print(f"  Tracking URI: {mlflow_url}")
-        print(f"  Experiment: {cfg.experiment_name}")
-        print(f"\n  To view results, run: mlflow ui --backend-store-uri {abs_mlruns_path}")
-        print(f"  Then open: http://127.0.0.1:5000")
-        print(f"{'='*80}\n")
-    else:
-        # Remote tracking server
-        print(f"\n{'='*80}")
-        print(f"MLflow Tracking:")
-        print(f"  Tracking URI: {mlflow_tracking_uri}")
-        print(f"  Experiment: {cfg.experiment_name}")
-        print(f"  Access UI at: {mlflow_tracking_uri}")
-        print(f"{'='*80}\n")
+    print(f"MLflow: experiment={cfg.experiment_name}, uri={mlflow_tracking_uri}")
 
     trainer = Trainer(max_epochs=cfg.epochs,
                       default_root_dir=cfg.run.dir,
@@ -503,64 +367,30 @@ def run(cfg: DictConfig):
                       accelerator='gpu' if torch.cuda.is_available() else 'cpu',
                       gradient_clip_val=cfg.grad_clip_val,
                       accumulate_grad_batches=cfg.get('accumulate_grad_batches', 1),
-                      callbacks=[early_stop_callback, checkpoint_callback, lr_monitor, mlflow_flush_callback],
-                      enable_progress_bar=True,  # Disable tqdm to keep logs concise
-                      log_every_n_steps=100  # Log every 100 steps
-                      )
+                      callbacks=[early_stop_callback, checkpoint_callback, lr_monitor],
+                      enable_progress_bar=True,
+                      log_every_n_steps=100)
 
     load_model_path = cfg.get('load_model_path')
     is_baseline = is_baseline_model(cfg.model.name)
     is_icon = is_icon_model(cfg.model.name)
     
     if is_baseline:
-        # Baseline models don't require training
-        print(f"\n{'='*80}")
-        print(f"Baseline Model: {cfg.model.name}")
-        print(f"  No training required - proceeding directly to evaluation")
-        print(f"{'='*80}\n")
+        print(f"Baseline model '{cfg.model.name}' - skipping training")
         result = dict()
     elif load_model_path is not None:
-        print(f"Loading model from checkpoint: {load_model_path}")
+        print(f"Loading model from: {load_model_path}")
         predictor.load_model(load_model_path)
         result = dict()
     else:
-        print("\n" + "="*80)
-        print("Starting training...")
-        print("="*80)
         train_loader = dm.train_dataloader()
         val_loader = dm.val_dataloader()
-        print(f"Train batches: {len(train_loader)}")
-        print(f"Val batches: {len(val_loader)}")
-        print("Calling trainer.fit()...")
-        sys.stdout.flush()  # Force output flush
+        print(f"Training: {len(train_loader)} train batches, {len(val_loader)} val batches")
         
-        trainer.fit(predictor,
-                    train_dataloaders=train_loader,
-                    val_dataloaders=val_loader)
-        best_checkpoint_path = checkpoint_callback.best_model_path
-        predictor.load_model(best_checkpoint_path)
+        trainer.fit(predictor, train_dataloaders=train_loader, val_dataloaders=val_loader)
+        predictor.load_model(checkpoint_callback.best_model_path)
         
-        # Print training summary
-        print(f"\n{'='*80}")
-        print(f"Training Complete!")
-        print(f"  Best checkpoint: {best_checkpoint_path}")
-        print(f"  Best validation metric ({monitored_metric}): {checkpoint_callback.best_model_score.item():.4f}")
-        
-        # Print MLflow run URL after training
-        if hasattr(exp_logger, 'run_id') and exp_logger.run_id:
-            if mlflow_tracking_uri is None or mlflow_tracking_uri == './mlruns' or mlflow_tracking_uri.startswith('file://'):
-                abs_mlruns_path = os.path.abspath('./mlruns')
-                print(f"\n  MLflow Run Details:")
-                print(f"    Run ID: {exp_logger.run_id}")
-                print(f"    Experiment: {cfg.experiment_name}")
-                print(f"    View run: mlflow ui --backend-store-uri {abs_mlruns_path}")
-                print(f"    Then navigate to: http://127.0.0.1:5000")
-            else:
-                print(f"\n  MLflow Run Details:")
-                print(f"    Run ID: {exp_logger.run_id}")
-                print(f"    Experiment: {cfg.experiment_name}")
-                print(f"    View run at: {mlflow_tracking_uri}")
-        print(f"{'='*80}\n")
+        print(f"Training complete: best {monitored_metric}={checkpoint_callback.best_model_score.item():.4f}")
         result = checkpoint_callback.best_model_score.item()
 
     predictor.freeze()
@@ -569,67 +399,48 @@ def run(cfg: DictConfig):
     # testing                              #
     ########################################
     
-    # ICON NWP evaluation (for ICON model or when nwp_test_set is True)
+    # ICON NWP evaluation
     if use_icon and isinstance(predictor, SamplingPredictor):
-        print(f"\n{'='*80}")
-        print(f"ICON NWP Baseline Evaluation")
-        print(f"{'='*80}\n")
-        
+        print("\nICON NWP Baseline Evaluation")
         icon_data = models.ICONData(pw_dataset=dataset)
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
         icon_metrics = icon_data.test_set_eval(
-            torch_dataset=torch_dataset,  # Use full dataset, not dm.testset
+            torch_dataset=torch_dataset,
             metrics=sample_metrics,
             predictor=predictor,
             batch_size=cfg.batch_size,
             device=device
         )
         
-        # Print ICON results
-        print(f"\n{'='*80}")
-        print(f"ICON NWP Test Results:")
-        print(f"{'='*80}")
+        print("ICON NWP Test Results:")
         for name, value in icon_metrics.compute().items():
-            if isinstance(value, torch.Tensor):
-                value = value.item()
+            value = value.item() if isinstance(value, torch.Tensor) else value
             print(f"  {name}: {value:.4f}")
-            logger.info(f" - {name}: {value:.5f}")
-        print(f"{'='*80}\n")
     
-    # Standard test evaluation (skip for ICON model since it uses custom evaluation)
+    # Standard test evaluation
     if not is_icon:
-        # Run standard test on all nodes
-        print(f"\n{'='*80}")
-        print("Test Evaluation: ALL NODES")
-        print('='*80)
+        print("\nTest Evaluation: ALL NODES")
         trainer.test(predictor, dataloaders=dm.test_dataloader())
         
-        # Run subset-specific evaluations
+        # Subset-specific evaluations
         test_subsets = cfg.get('test_subsets', ['meteo_only', 'all_with_temp'])
-        
         if test_subsets:
             device = 'cuda' if torch.cuda.is_available() else 'cpu'
             predictor.to(device)
             
             for subset_name in test_subsets:
                 if subset_name not in station_subsets:
-                    logger.warning(f"Unknown subset '{subset_name}', skipping")
                     continue
                 
                 node_mask = station_subsets[subset_name]
                 n_nodes_in_subset = node_mask.sum()
-                
                 if n_nodes_in_subset == 0:
-                    logger.warning(f"Subset '{subset_name}' has no nodes, skipping")
                     continue
                 
-                print(f"\n{'='*80}")
-                print(f"Test Evaluation: {subset_name.upper()} ({n_nodes_in_subset} nodes)")
-                print('='*80)
+                print(f"\nTest Evaluation: {subset_name.upper()} ({n_nodes_in_subset} nodes)")
                 
-                # Create fresh metrics for this subset and move to device
-                # Include horizon-specific metrics (same as main evaluation)
+                # Create metrics for this subset
                 horizon_at = [1, 3, 6, 12, 18, 24]
                 subset_point_metrics = {
                     'mae': torch_metrics.MaskedMAE().to(device),
@@ -644,90 +455,51 @@ def run(cfg: DictConfig):
                     **{f'ens_{h:d}h': lib.metrics.EnergyScore(at=h-1).to(device) for h in horizon_at if h <= cfg.horizon},
                 }
                 
-                # Combine metrics based on predictor type
-                if isinstance(predictor, SamplingPredictor):
-                    subset_metrics = {**subset_point_metrics, **subset_sample_metrics}
-                else:
-                    subset_metrics = subset_point_metrics
-                
-                # Reset metrics
+                subset_metrics = {**subset_point_metrics, **subset_sample_metrics} if isinstance(predictor, SamplingPredictor) else subset_point_metrics
                 for m in subset_metrics.values():
                     m.reset()
                 
-                # Evaluate on test set with node filtering
                 test_loader = dm.test_dataloader()
                 node_mask_tensor = torch.tensor(node_mask, dtype=torch.bool, device=device)
                 
                 with torch.no_grad():
                     for batch in test_loader:
-                        # Move batch to device
                         batch = batch.to(device)
-                        
-                        # Get predictions
-                        if isinstance(predictor, SamplingPredictor):
-                            # Sample predictions for probabilistic models
-                            y_hat = predictor.predict_step(batch, batch_idx=0)
-                        else:
-                            y_hat = predictor.predict_step(batch, batch_idx=0)
-                        
-                        # Get target and mask
+                        y_hat = predictor.predict_step(batch, batch_idx=0)
                         y = batch.y
                         batch_mask = batch.mask
                         
-                        # Apply node subset mask
-                        # Expand node_mask to match batch dimensions: (B, H, N, C)
                         node_mask_expanded = node_mask_tensor.view(1, 1, -1, 1).expand_as(batch_mask)
                         combined_mask = batch_mask & node_mask_expanded
 
-                        # Ensure y_hat is a tensor (predict_step may return tuple/list/dict)
                         if isinstance(y_hat, (list, tuple)):
                             y_hat = y_hat[0]
                         elif isinstance(y_hat, dict):
-                            # common key names; fallback to first value
                             y_hat = y_hat.get('y_hat', next(iter(y_hat.values())))
 
-                        # Slice to selected nodes (handles both 4D and 5D via ellipsis)
                         y_hat_subset = y_hat[..., node_mask_tensor, :]
                         y_subset = y[..., node_mask_tensor, :]
                         mask_subset = combined_mask[..., node_mask_tensor, :]
                         
-                        # Update metrics with filtered data
-                        # SampleMetric expects: y_hat [S, B, H, N, C], y/mask [B, H, N, C]
-                        # Point metrics expect: y_hat [B, H, N, C], y/mask [B, H, N, C]
                         is_sampled = y_hat_subset.dim() == 5 and y_subset.dim() == 4
-                        
                         for name, metric in subset_metrics.items():
                             if name in subset_sample_metrics:
-                                # SampleMetric: pass as-is (different shapes expected)
                                 metric.update(y_hat_subset, y_subset, mask_subset)
                             else:
-                                # Point metric: reduce samples to mean
-                                if is_sampled:
-                                    y_hat_point = y_hat_subset.mean(dim=0)
-                                else:
-                                    y_hat_point = y_hat_subset
+                                y_hat_point = y_hat_subset.mean(dim=0) if is_sampled else y_hat_subset
                                 metric.update(y_hat_point, y_subset, mask_subset)
                 
-                # Compute and print results
-                print(f"  Results for {subset_name}:")
+                # Print and log results
                 for name, metric in subset_metrics.items():
                     value = metric.compute()
-                    if isinstance(value, torch.Tensor):
-                        value = value.item()
-                    print(f"    test_{name}: {value:.4f}")
+                    value = value.item() if isinstance(value, torch.Tensor) else value
+                    print(f"  test_{name}: {value:.4f}")
                     
-                    # Log to MLflow
                     if hasattr(exp_logger, 'experiment') and exp_logger.experiment:
                         try:
-                            exp_logger.experiment.log_metric(
-                                exp_logger.run_id,
-                                f"test_{subset_name}_{name}",
-                                value
-                            )
+                            exp_logger.experiment.log_metric(exp_logger.run_id, f"test_{subset_name}_{name}", value)
                         except Exception:
                             pass
-                
-                print('='*80)
 
     return result
 
