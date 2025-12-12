@@ -4,19 +4,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Spatiotemporal deep learning models for temperature prediction using the PeakWeather dataset from MeteoSwiss weather stations. Uses PyTorch Lightning with Hydra configuration management.
+GDL (Graph Deep Learning) course project for temperature forecasting using the PeakWeather dataset from MeteoSwiss. The goal is to assess spatiotemporal graph neural networks (STGNNs) for temperature prediction and whether lower-quality rain gauge observations improve forecasting accuracy.
+
+Built on PyTorch Lightning, tsl (torch-spatiotemporal), and Hydra for configuration.
 
 ## Commands
 
-### Installation
+### Environment Setup
 ```bash
 conda env create -f conda_env.yml
 conda activate peakweather-env
 ```
 
-### Training
+### Training Models
 ```bash
-# Basic training (runs TCN by default)
+# Basic training (uses Hydra config system)
 python -m experiments.run_temperature_prediction dataset=temperature model=tcn
 
 # With custom hyperparameters
@@ -24,66 +26,108 @@ python -m experiments.run_temperature_prediction dataset=temperature model=stgnn
 
 # Probabilistic training with Energy Score loss
 python -m experiments.run_temperature_prediction dataset=temperature model=tcn loss_fn=ens sampling.mc_samples_train=16
+
+# Train with specific seed (run 5 seeds for final evaluation)
+python -m experiments.run_temperature_prediction dataset=temperature model=stgnn seed=42
 ```
 
-### Evaluation
+### Evaluating Models
 ```bash
-# Load and evaluate saved checkpoint (skips training)
-python -m experiments.run_temperature_prediction dataset=temperature model=tcn load_model_path=logs/Temperature/tcn/2025-11-20/17-53-24/epoch_XX-step_XXXXXX.ckpt
-```
+# Load and evaluate a saved checkpoint (skips training)
+python -m experiments.run_temperature_prediction dataset=temperature model=tcn load_model_path=path/to/checkpoint.ckpt
 
-### Baselines (no training)
-```bash
+# Run baselines (no training needed)
 python -m experiments.run_temperature_prediction dataset=temperature model=naive
 python -m experiments.run_temperature_prediction dataset=temperature model=moving_avg
+
+# Evaluate ICON NWP baseline
+python -m experiments.run_temperature_prediction dataset=temperature model=icon
 ```
 
-### Batch Training
+### Experiment Tracking
 ```bash
-bash train_all_models.sh [optional_seed]
-bash run_all_seeds.sh
+mlflow ui --port 5000  # View at http://127.0.0.1:5000
 ```
 
-### MLflow UI
-```bash
-mlflow ui --port 5000
-```
+## Dataset Details
+
+### PeakWeather Dataset
+- **Source**: SwissMetNet network operated by MeteoSwiss
+- **Stations**: 302 total (160 meteo stations + 142 rain gauges)
+- **Variables**: temperature, humidity, precipitation, sunshine, pressure, wind_speed, wind_gust, wind_direction
+- **Resolution**: 10-minute intervals, resampled to hourly for this project
+- **Time span**: Jan 2017 - Mar 2025 (8+ years)
+- **Topographic features**: altitude, slope, aspect, TPI, STD at 2km and 10km scales
+
+### Station Types
+- **Meteo stations**: High-quality temperature sensors, full sensor suite
+- **Rain gauges**: Lower-grade temperature sensors (primarily for precipitation type discrimination)
+
+### Data Splits
+- Training: until Dec 31, 2023
+- Validation: Jan 1, 2024 - Mar 31, 2024
+- Test: starts April 1, 2024
+
+### NWP Baseline (ICON-CH1-EPS)
+- 11-member ensemble (1 control + 10 perturbed)
+- Forecasts every 3 hours, up to 33 hours ahead
+- Available since May 14, 2024
+- Use ensemble median for MAE, all members for EnergyScore
 
 ## Architecture
 
-### Entry Point
-`experiments/run_temperature_prediction.py` - Main training/evaluation script. Contains `MODEL_REGISTRY` dict mapping model names to classes.
+### Configuration (Hydra)
+- `config/default.yaml`: Training defaults (epochs, batch_size, loss_fn, optimizer)
+- `config/dataset/temperature.yaml`: Dataset settings (target_channels, covariates, connectivity)
+- `config/model/*.yaml`: Model-specific hyperparameters
 
-### Core Modules
-- `lib/datasets/peakweather.py` - Dataset wrapper for torch-spatiotemporal, handles temporal resampling and missing data
-- `lib/nn/models/learnable_models/` - Trainable models (TCN, RNN, STGNN, AttentionLongTermSTGNN)
-- `lib/nn/models/baselines/` - Non-trainable baselines (Naive, MovingAverage, ICON)
-- `lib/nn/predictors/` - Lightning predictors (`Predictor` for deterministic, `SamplingPredictor` for probabilistic)
-- `lib/nn/layers/sampling_readout.py` - Gaussian readout layers for uncertainty quantification
-- `lib/metrics/` - Energy Score (CRPS), MAE/MSE for samples
+### Model Registry (`experiments/run_temperature_prediction.py`)
+Learnable models: `tcn`, `rnn`, `stgnn`, `attn_longterm`
+Baselines: `naive`, `moving_avg`, `icon`
 
-### Model Hierarchy
-All models inherit from `BaseModel` (torch-spatiotemporal):
-- **TCN**: Dilated causal convolutions, no graph structure
-- **RNN**: GRU encoder with learnable node embeddings
-- **STGNN**: Time-then-space architecture (GRU + graph convolutions)
-- **AttentionLongTermSTGNN**: Patchified transformer + graph convolutions
+### Model Descriptions
+- **TCN**: Temporal Convolutional Network (no graph structure)
+- **RNN**: GRU-based with node embeddings (no graph structure)
+- **STGNN**: Spatiotemporal GNN with diffusion convolution + gated TCN
+- **AttentionLongTermSTGNN** (`attn_longterm`): Two-stage architecture inspired by traffic prediction literature:
+  1. Long-term feature extraction via masked autoencoding with Transformer
+  2. Prediction via attention-based STGNN (STAWnet backbone)
 
-### Configuration
-Hydra configs in `config/`:
-- `default.yaml` - Training defaults (epochs=120, patience=25, loss_fn=ens)
-- `dataset/temperature.yaml` - Windowing (72h input, 24h horizon), connectivity (12-NN graph)
-- `model/*.yaml` - Model-specific hyperparameters
+### Core Components
+- **lib/datasets/peakweather.py**: `PeakWeather` class wrapping the PeakWeatherDataset with tsl's `DatetimeDataset`
+- **lib/nn/models/learnable_models/**: Neural network architectures
+- **lib/nn/models/baselines/**: Non-trainable baselines (Naive, MovingAverage, ICON NWP)
+- **lib/nn/predictors/predictor.py**: `Predictor` and `SamplingPredictor` (for probabilistic forecasting)
+- **lib/metrics/**: `EnergyScore` for probabilistic loss, `SampleMAE`/`SampleMSE` for sample-based evaluation
 
-### Data Format
-- Tensors shape: `[batch, time, nodes, features]`
-- Probabilistic samples: `[mc_samples, batch, time, nodes, features]`
-- Nodes = weather stations; edges = spatial proximity (12-nearest neighbors)
+### Probabilistic Forecasting
+When `loss_fn=ens`, models use `SamplingPredictor` which generates Monte Carlo samples:
+- `sampling.mc_samples_train`: Samples during training (default: 16)
+- `sampling.mc_samples_eval`: Samples during validation (default: 11)
+- `sampling.mc_samples_test`: Samples during testing (default: 20)
 
-### Data Splits
-- Training: Before 2024-01-01
-- Validation: 2024-01-01 to 2024-03-31
-- Test: 2024-04-01 onwards
+## Evaluation Requirements
 
-### Checkpoints
-Stored in `logs/Temperature/{model_name}/{date}/{time}/epoch_XX-step_XXXXXX.ckpt`
+### Metrics
+- **MAE**: Mean Absolute Error (use SampleMAE with ensemble median for probabilistic models)
+- **EnergyScore (CRPS)**: Continuous Ranked Probability Score for probabilistic forecasts
+
+### Report metrics at specific horizons
+t=1h, t=3h, t=6h, t=12h, t=18h, t=24h
+
+### Experimental Protocol
+1. Tune hyperparameters on validation MAE
+2. Train best configuration with 5 different seeds
+3. Report mean and std on test set
+
+### Station Subset Evaluations
+- `meteo_only`: Only meteo stations
+- `all_with_temp`: All stations with temperature data
+- When using rain gauges: compare train-all/test-meteo vs train-all/test-all
+
+## Reference Documentation
+
+See `docs/` folder:
+- `peakweather-paper.pdf`: Dataset paper (arXiv:2506.13652)
+- `peakweather-project.pdf`: Project deliverables and requirements
+- `stgnn-att-paper.pdf`: Attention-based STGNN architecture reference
