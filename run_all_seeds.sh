@@ -31,7 +31,7 @@ for SEED in "${SEEDS[@]}"; do
         python -u -m experiments.run_temperature_prediction \
             dataset=${DATASET} \
             model=${MODEL} \
-            seed=${SEED}
+            seed=${SEED} \
 
         echo ""
         echo "✓ ${MODEL} (seed ${SEED}) completed"

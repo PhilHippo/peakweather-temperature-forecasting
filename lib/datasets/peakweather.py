@@ -93,8 +93,19 @@ class PeakWeather(DatetimeDataset):
                                interpolation_method=interpolation_method,
                                compute_uv=compute_uv,
                                freq=freq,
-                               station_type=station_type,
+                               station_type=None,  # Filter locally instead
                                extended_nwp_vars=extended_nwp_vars)
+        
+        # Apply station_type filtering locally (after parameter filtering)
+        if station_type is not None:
+            station_mask = ds.stations_table['station_type'] == station_type
+            valid_stations = ds.stations_table[station_mask].index
+            # Filter observations and mask to only include valid stations
+            obs_stations = ds.observations.columns.get_level_values(0).unique()
+            valid_stations = valid_stations.intersection(obs_stations)
+            ds.observations = ds.observations.loc[:, (valid_stations, slice(None))]
+            ds.mask = ds.mask.loc[:, (valid_stations, slice(None))]
+            ds.stations_table = ds.stations_table.loc[valid_stations]
         covariates = {
             "stations_table": (ds.stations_table, "n f"),
             "installation_table": (ds.installation_table, "f f"),
